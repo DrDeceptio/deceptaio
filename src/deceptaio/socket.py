@@ -187,7 +187,6 @@ class Socket(asyncio.Protocol):
         return data
 
     async def _wait_for_buffer(self, caller_name: str) -> None:
-
         """Used internally to wait until the buffer has data.
 
         Arguments:
