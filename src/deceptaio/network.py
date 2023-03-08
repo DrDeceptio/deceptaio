@@ -207,3 +207,188 @@ class Socket(asyncio.Protocol):
             await self.buffer_awaiter
         finally:
             self.buffer_awaiter = None
+
+
+class Protocol(asyncio.Protocol):
+    """Base class for creating asyncio Protocols.
+
+    Notes:
+        This is similar to the Socket() class, but meant to be inherited.
+
+    Attributes:
+        _connected: Set when _connected, Cleared when not.
+        _loop: Currently running event loop.
+        _transport: Underlying asyncio Transport.
+        _exc: Set to the exception information, if provided, when a connection
+            is lost.
+        _flush_awaiters: List of asyncio Futures awaiting the flush() method.
+        _writing_paused: True when the transport buffer goes over the high
+            water mark.
+        _buffer: Internal buffer of received data.
+        _buffer_awaiter: Future used to await the _buffer_wait() method.
+    """
+
+    __slots__ = (
+        'connected', '_loop', '_transport', '_exc', '_flush_awaiters',
+        '_writing_paused', '_buffer', '_buffer_awaiter'
+    )
+
+    _connected: Flag
+    _loop: asyncio.AbstractEventLoop
+    _transport: asyncio.Transport | None
+    _exc: Exception | None
+    _flush_awaiters: list[asyncio.Future]
+    _writing_paused: bool
+    _buffer: bytearray
+    _buffer_awaiter: asyncio.Future | None
+
+    def __init__(self) -> None:
+        self._connected = Flag(False)
+        self._loop = asyncio.get_running_loop()
+        self._transport = None
+        self._exc = None
+        self._flush_awaiters = list()
+        self._writing_paused = True
+        self._buffer = bytearray()
+        self._buffer_awaiter = None
+
+    def connection_made(self, transport: asyncio.Transport) -> None:
+        self._transport = transport
+        self._writing_paused = False
+        self._connected.set()
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        self._writing_paused = True
+        self._exc = exc
+        self._connected.clear()
+
+    def data_received(self, data: bytes) -> None:
+        self._buffer.extend(data)
+
+        # Check to see if we need to wake an awaiting coroutine
+        buffer_awaiter = self._buffer_awaiter
+        if buffer_awaiter is not None:
+            self._buffer_awaiter = None
+            if not buffer_awaiter.cancelled():
+                buffer_awaiter.set_result(None)
+
+    def pause_writing(self) -> None:
+        self._writing_paused = True
+
+    def resume_writing(self) -> None:
+        self._writing_paused = False
+
+        # Wake any coroutines awaiting the flush() method.
+        for awaiter in self._flush_awaiters:
+            if not awaiter.done():
+                awaiter.set_result(None)
+
+    async def close(self) -> None:
+        """Closes the network connection."""
+
+        self._writing_paused = True
+        self._connected.clear()
+        self._transport.close()
+        await asyncio.sleep(0)  # Give the transport a chance to close
+
+    async def write(self, data: bytes) -> None:
+        """Writes data via the transport.
+
+        Arguments:
+            data: The data to write.
+        """
+
+        self._transport.write(data)
+        await self.flush()
+
+    async def flush(self) -> None:
+        """Method awaited to ensure data is flushed."""
+
+        if not self._writing_paused:
+            return
+
+        awaiter = self._loop.create_future()
+        self._flush_awaiters.append(awaiter)
+
+        try:
+            await awaiter
+        finally:
+            self._flush_awaiters.remove(awaiter)
+
+    async def read(self, size: int) -> bytes:
+        """Reads (at most size) bytes.
+
+        Arguments:
+            size: The maximum number of bytes to receive.
+
+        Returns:
+            The received bytes.
+
+        Raises:
+            ValueError: If size is < 0.
+        """
+
+        if size < 0:
+            raise ValueError(f'Invalid size {size}, must be >= 0')
+        elif size == 0:
+            return b''
+
+        if not self._buffer:
+            await self._wait_for_buffer('read')
+
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+
+        return data
+
+    async def read_exact(self, size: int) -> bytes:
+        """Reads (exactly) size bytes.
+
+        Arguments:
+            size: The number of bytes to receive.
+
+        Returns:
+            The requested data.
+
+        Raises:
+            ValueError: If size is < 0.
+        """
+
+        if size < 0:
+            raise ValueError(f'Invalid size {size}, must be >= 0')
+        elif size == 0:
+            return b''
+
+        while len(self._buffer) < size:
+            await self._wait_for_buffer('read_exact')
+
+        if len(self._buffer) == size:
+            data = bytes(self._buffer)
+            self._buffer.clear()
+        else:
+            data = bytes(self._buffer[:size])
+            del self._buffer[:size]
+
+        return data
+
+    async def _wait_for_buffer(self, caller_name: str) -> None:
+        """Used internally to wait until the buffer has data.
+
+        Arguments:
+            caller_name: The name of the function awaiting this method.
+
+        Raises:
+            RuntimeError: If another function is already awaiting this one.
+        """
+
+        if self._buffer_awaiter is not None:
+            raise RuntimeError(
+                f'{caller_name}() called when another coroutine is awaiting '
+                f'the buffer'
+            )
+
+        self._buffer_awaiter = self._loop.create_future()
+        try:
+            await self._buffer_awaiter
+        finally:
+            self._buffer_awaiter = None
